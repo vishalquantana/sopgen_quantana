@@ -71,6 +71,7 @@ function statusLabel(status) {
     complete: 'Complete',
     error: 'Error',
     paused: 'Paused',
+    scoring: 'Regenerating Scores',
   };
   return labels[status] || status;
 }
@@ -402,19 +403,38 @@ function renderVideoDetailContent(video) {
   if (isConfirming) return;
 
   const app = document.getElementById('app');
-  const isProcessing = ['processing', 'transcribing', 'segmenting', 'generating_clips', 'generating_sops'].includes(video.status);
+  const isProcessing = ['processing', 'transcribing', 'segmenting', 'generating_clips', 'generating_sops', 'scoring'].includes(video.status);
   const clips = video.clips || [];
 
   let clipsHtml = '';
-  if (isProcessing || video.status === 'paused') {
+  if (['processing', 'transcribing', 'segmenting', 'generating_clips', 'generating_sops', 'paused', 'scoring'].includes(video.status)) {
     const statusMessages = {
       processing: 'Preparing video...',
       transcribing: 'Transcribing audio...',
       segmenting: 'Segmenting topics...',
       generating_clips: 'Generating clips...',
       generating_sops: 'Creating SOPs...',
+      scoring: 'Regenerating tutorial scores...',
       paused: 'Processing paused.',
     };
+
+    let regenProgressHtml = '';
+    if (video.status === 'scoring') {
+      const match = (video.pipeline_logs || '').match(/\[PROGRESS: (\d+)\/(\d+)\]/g);
+      if (match) {
+        const lastMatch = match[match.length - 1];
+        const m = lastMatch.match(/\[PROGRESS: (\d+)\/(\d+)\]/);
+        const current = parseInt(m[1]);
+        const total = parseInt(m[2]);
+        const pct = Math.round((current / total) * 100);
+        regenProgressHtml = `
+          <div class="regen-progress-container" style="margin: 1rem 0; width: 100%;">
+            <div class="progress-bar"><div class="progress-bar-fill" style="width: ${pct}%;"></div></div>
+            <div style="font-size: 0.8rem; margin-top: 0.4rem; color: var(--text-secondary);">${pct}% (${current}/${total} clips)</div>
+          </div>
+        `;
+      }
+    }
 
     const logs = (video.pipeline_logs || '').split('\n').filter(Boolean).slice(-8).reverse();
 
@@ -422,7 +442,8 @@ function renderVideoDetailContent(video) {
       <div class="card processing-status">
         <div class="${video.status === 'paused' ? '' : 'spinner'}"></div>
         <h3>${statusMessages[video.status] || 'Processing...'}</h3>
-        ${video.estimated_finish_at && video.status !== 'paused' ? `
+        ${regenProgressHtml}
+        ${video.estimated_finish_at && !['paused', 'scoring'].includes(video.status) ? `
           <div class="estimate-badge">Roughly ${Math.ceil((new Date(video.estimated_finish_at) - Date.now()) / 60000)}m remaining</div>
         ` : ''}
         <div class="pipeline-logs">
@@ -470,6 +491,8 @@ function renderVideoDetailContent(video) {
         ${video.status === 'paused' ? `<button class="btn btn-primary" onclick="resumeVideo('${video.id}')">▶ Resume</button>` : ''}
         ${video.status === 'error' ? `<button class="btn btn-primary" onclick="processVideo('${video.id}')">🔄 Retry</button>` : ''}
         ${isProcessing ? `<button class="btn btn-danger" onclick="pauseVideo('${video.id}')">⏸ Pause</button>` : ''}
+        ${video.status === 'complete' || video.status === 'paused' ? `<button class="btn btn-secondary" onclick="recalcScores('${video.id}')">🎓 Recalculate Scores</button>` : ''}
+        <button class="btn btn-secondary btn-sm" onclick="exportVideoJson('${video.id}')">📂 Export JSON (Debug)</button>
         <button class="btn btn-danger btn-sm" style="opacity:0.6;" onclick="deleteVideo('${video.id}')">Delete</button>
       </div>
     </div>
@@ -477,10 +500,30 @@ function renderVideoDetailContent(video) {
   `;
 }
 
+async function exportVideoJson(id) {
+  try {
+    const res = await fetch(`/api/videos/${id}/export-json`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `video_${id}_debug.json`;
+    a.click();
+    showToast('JSON Export successful!', 'success');
+  } catch (e) { showToast('Export failed', 'error'); }
+}
+
 // Handlers
 async function processVideo(id) {
   try { await api.post(`/api/videos/${id}/process`); showToast('Processing started', 'info'); renderVideoDetail(id); }
   catch (e) { showToast(e.message, 'error'); }
+}
+async function recalcScores(id) {
+  try {
+    await api.post(`/api/videos/${id}/regen-scores`);
+    showToast('Score regeneration started', 'info');
+    renderVideoDetail(id);
+  } catch (e) { showToast(e.message, 'error'); }
 }
 async function pauseVideo(id) {
   isConfirming = true;
@@ -539,26 +582,108 @@ async function renderSop(clipId) {
       ${clip.file_path ? `<div class="sop-clip-player card-glass"><video controls><source src="/data/${clip.file_path}" type="video/mp4"></video></div>` : ''}
 
       <div class="sop-steps">
-        ${steps.map(step => `
-          <div class="card sop-step">
+        ${steps.length > 0 ? steps.map(step => `
+          <div class="card sop-step ${step.is_hidden ? 'sop-step-hidden' : ''}" data-step-id="${step.id}">
             <div class="sop-step-screenshot">
-              ${step.screenshot_path ? `<img src="/data/${step.screenshot_path}">` : 'No Image'}
+              ${step.screenshot_path ? `<img src="/data/${step.screenshot_path}" alt="Step ${step.step_number}">` : `<div class="no-image">No screenshot</div>`}
             </div>
             <div class="sop-step-content">
-              <div class="sop-step-number">Step ${step.step_number}</div>
-              <div class="sop-step-instruction">${escapeHtml(step.instruction)}</div>
-              ${step.code_or_prompt ? `
-                <div class="sop-step-code">
-                  <button class="copy-btn" onclick="copyToClipboard(this, \`${step.code_or_prompt.replace(/`/g, '\\`')}\`)">Copy</button>
-                  ${escapeHtml(step.code_or_prompt)}
+              <div class="sop-step-header">
+                <div class="sop-step-number">Step ${step.step_number}</div>
+                <div class="sop-step-actions">
+                  <button class="btn-icon" title="Edit" onclick="editStep('${step.id}')">✏️</button>
+                  <button class="btn-icon" title="${step.is_hidden ? 'Show' : 'Hide'}" onclick="toggleStepVisibility('${step.id}', ${!step.is_hidden})">
+                    ${step.is_hidden ? '👁️' : '🙈'}
+                  </button>
+                  <button class="btn-icon text-danger" title="Delete" onclick="deleteStep('${step.id}')">🗑️</button>
                 </div>
-              ` : ''}
+              </div>
+              
+              <div class="sop-step-view" id="step-view-${step.id}">
+                <div class="sop-step-instruction">${escapeHtml(step.instruction)}</div>
+                ${step.code_or_prompt ? `
+                  <div class="sop-step-code">
+                    <button class="copy-btn" onclick="copyToClipboard(this, \`${escapeForAttr(step.code_or_prompt)}\`)">Copy</button>
+                    ${escapeHtml(step.code_or_prompt)}
+                  </div>
+                ` : ''}
+              </div>
+
+              <div class="sop-step-edit" id="step-edit-${step.id}" style="display:none">
+                <textarea class="form-control" id="edit-instruction-${step.id}" rows="3">${escapeHtml(step.instruction)}</textarea>
+                <textarea class="form-control code-textarea" id="edit-code-${step.id}" rows="2" placeholder="Code or prompt (optional)">${escapeHtml(step.code_or_prompt || '')}</textarea>
+                <div class="edit-actions">
+                  <button class="btn btn-sm btn-primary" onclick="saveStep('${step.id}')">Save</button>
+                  <button class="btn btn-sm btn-secondary" onclick="cancelEdit('${step.id}')">Cancel</button>
+                </div>
+              </div>
             </div>
           </div>
-        `).join('')}
+        `).join('') : '<div class="empty-state"><p>No SOP steps generated for this clip.</p></div>'}
       </div>
     `;
-  } catch (e) { showToast(e.message, 'error'); }
+  } catch (err) {
+    app.innerHTML = `<div class="empty-state"><p style="color:var(--error)">Failed to load SOP: ${escapeHtml(err.message)}</p></div>`;
+  }
+}
+
+function editStep(stepId) {
+  document.getElementById(`step-view-${stepId}`).style.display = 'none';
+  document.getElementById(`step-edit-${stepId}`).style.display = 'block';
+}
+
+function cancelEdit(stepId) {
+  document.getElementById(`step-view-${stepId}`).style.display = 'block';
+  document.getElementById(`step-edit-${stepId}`).style.display = 'none';
+}
+
+async function saveStep(stepId) {
+  const instruction = document.getElementById(`edit-instruction-${stepId}`).value;
+  const codeOrPrompt = document.getElementById(`edit-code-${stepId}`).value;
+
+  try {
+    await api.patch(`/api/videos/steps/${stepId}`, { instruction, codeOrPrompt });
+    showToast('Step updated', 'success');
+    // Reload SOP view to show changes
+    const hash = window.location.hash.slice(1);
+    const clipId = hash.split('/').pop();
+    renderSop(clipId);
+  } catch (err) {
+    showToast('Failed to update: ' + err.message, 'error');
+  }
+}
+
+async function toggleStepVisibility(stepId, isHidden) {
+  try {
+    await api.patch(`/api/videos/steps/${stepId}`, { isHidden });
+    showToast(isHidden ? 'Step hidden from export' : 'Step visible', 'info');
+    const hash = window.location.hash.slice(1);
+    const clipId = hash.split('/').pop();
+    renderSop(clipId);
+  } catch (err) {
+    showToast('Failed to toggle: ' + err.message, 'error');
+  }
+}
+
+async function deleteStep(stepId) {
+  isConfirming = true;
+  if (!confirm('Permanently delete this SOP step?')) { isConfirming = false; return; }
+  isConfirming = false;
+
+  try {
+    await api.del(`/api/videos/steps/${stepId}`);
+    showToast('Step deleted', 'success');
+    const hash = window.location.hash.slice(1);
+    const clipId = hash.split('/').pop();
+    renderSop(clipId);
+  } catch (err) {
+    showToast('Delete failed: ' + err.message, 'error');
+  }
+}
+
+function escapeForAttr(str) {
+  if (!str) return '';
+  return str.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$');
 }
 
 function copyToClipboard(btn, text) {

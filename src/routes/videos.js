@@ -6,6 +6,8 @@ const { v4: uuid } = require('uuid');
 const { stmts, DATA_DIR } = require('../db');
 const media = require('../services/media');
 const { processVideo } = require('../services/pipeline');
+const whisper = require('../services/whisper');
+const parakeet = require('../services/parakeet');
 
 const router = express.Router();
 
@@ -197,9 +199,10 @@ router.post('/:id/process', async (req, res) => {
     try {
         const video = stmts.getVideo.get(req.params.id);
         if (!video) return res.status(404).json({ error: 'Video not found' });
-        if (video.status !== 'uploaded' && video.status !== 'error') {
-            return res.status(400).json({ error: `Video is currently ${video.status}, cannot start processing` });
-        }
+
+        // Reset status to allow processing and clear any previous errors
+        stmts.updateVideoStatus.run({ id: req.params.id, status: 'processing' });
+        stmts.addPipelineLog.run({ id: req.params.id, message: '🚀 Starting/Retrying pipeline processing...' });
 
         res.json({ status: 'processing', message: 'Processing started' });
 
@@ -222,6 +225,10 @@ router.post('/:id/stop', async (req, res) => {
             // Set to paused instead of error, so it can be resumed
             stmts.updateVideoStatus.run({ id: req.params.id, status: 'paused' });
             stmts.addPipelineLog.run({ id: req.params.id, message: '⏸ Processing paused by user.' });
+
+            // Kill any active local transcription
+            whisper.killTranscription(req.params.id);
+            parakeet.killTranscription(req.params.id);
         }
 
         res.json({ success: true, message: 'Processing paused' });
@@ -255,6 +262,61 @@ router.post('/:id/resume', async (req, res) => {
         processVideo(req.params.id).catch(err => {
             console.error('Pipeline error:', err);
         });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.post('/:id/regen-scores', async (req, res) => {
+    try {
+        const video = stmts.getVideo.get(req.params.id);
+        if (!video) return res.status(404).json({ error: 'Video not found' });
+
+        res.json({ success: true, message: 'Score regeneration started' });
+
+        // Run in background
+        const { regenerateScores } = require('../services/pipeline');
+        regenerateScores(req.params.id).catch(err => {
+            console.error('Score regen error:', err);
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ---- SOP Step Management ----
+
+router.patch('/steps/:id', async (req, res) => {
+    try {
+        const { instruction, codeOrPrompt, isHidden } = req.body;
+        const step = stmts.getSopStep.get(req.params.id);
+        if (!step) return res.status(404).json({ error: 'Step not found' });
+
+        if (instruction !== undefined || codeOrPrompt !== undefined) {
+            stmts.updateSopStep.run({
+                id: req.params.id,
+                instruction: instruction !== undefined ? instruction : step.instruction,
+                codeOrPrompt: codeOrPrompt !== undefined ? codeOrPrompt : step.code_or_prompt
+            });
+        }
+
+        if (isHidden !== undefined) {
+            stmts.updateSopStepVisibility.run({
+                id: req.params.id,
+                isHidden: isHidden ? 1 : 0
+            });
+        }
+
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.delete('/steps/:id', async (req, res) => {
+    try {
+        stmts.deleteSopStep.run(req.params.id);
+        res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -314,6 +376,33 @@ router.delete('/:id', (req, res) => {
 });
 
 // ---- GET /api/videos/clips/:clipId/export ----
+// ---- GET /api/videos/:id/export-json ----
+router.get('/:id/export-json', async (req, res) => {
+    try {
+        const video = stmts.getVideo.get(req.params.id);
+        if (!video) return res.status(404).json({ error: 'Video not found' });
+
+        const clips = stmts.getClipsByVideo.all(video.id);
+        const clipsWithSops = clips.map(clip => {
+            const sopSteps = stmts.getSopStepsByClip.all(clip.id);
+            return { ...clip, sopSteps };
+        });
+
+        const fullData = {
+            ...video,
+            clips: clipsWithSops
+        };
+
+        const safeTitle = (video.title || 'sop').replace(/[^a-z0-9]/gi, '_').toLowerCase();
+        res.set('Content-Type', 'application/json');
+        res.set('Content-Disposition', `attachment; filename="${safeTitle}_debug.json"`);
+        res.json(fullData);
+    } catch (err) {
+        console.error('JSON Export error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 router.get('/clips/:clipId/export', async (req, res) => {
     try {
         const { clipId } = req.params;
@@ -354,10 +443,11 @@ router.get('/clips/:clipId/export', async (req, res) => {
         }
 
         // 2. Generate HTML
-        let stepsHtml = steps.map(step => `
+        let visibleSteps = steps.filter(s => !s.is_hidden);
+        let stepsHtml = visibleSteps.map((step, index) => `
             <div class="step" style="margin-bottom: 3rem; page-break-inside: avoid; border-bottom: 1px solid #eee; padding-bottom: 2rem;">
                 <div class="step-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 1rem;">
-                    <h2 style="margin:0; color:#2563eb;">Step ${step.step_number}</h2>
+                    <h2 style="margin:0; color:#2563eb;">Step ${index + 1}</h2>
                 </div>
                 <div class="instruction" style="font-size: 1.2rem; line-height: 1.6; margin-bottom: 1.5rem;">
                     ${step.instruction}

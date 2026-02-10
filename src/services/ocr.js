@@ -21,12 +21,11 @@ async function extractText(imagePath) {
  * Returns array of { path, text } objects.
  */
 async function extractTextBatch(imagePaths) {
-    const results = [];
-    for (const imgPath of imagePaths) {
+    const promises = imagePaths.map(async (imgPath) => {
         const text = await extractText(imgPath);
-        results.push({ path: imgPath, text });
-    }
-    return results;
+        return { path: imgPath, text };
+    });
+    return Promise.all(promises);
 }
 
 module.exports = { extractText, extractTextBatch };

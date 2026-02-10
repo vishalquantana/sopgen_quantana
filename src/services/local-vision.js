@@ -73,19 +73,29 @@ async function generateSopStepsLocal(frames, transcriptSlice, segmentTitle, ocrT
     const steps = [];
     let totalScore = 0;
 
+    let lastOcrText = '';
+
     for (let i = 0; i < frames.length; i++) {
         const frame = frames[i];
-        const ocrText = ocrTexts?.[i] || '';
+        const ocrText = (ocrTexts?.[i] || '').trim();
 
-        const prompt = `You are creating step ${i + 1} of an SOP (Standard Operating Procedure) for a tutorial titled "${segmentTitle}".
+        // DE-DUPLICATION: Skip if OCR text is nearly identical to previous frame
+        if (ocrText && ocrText === lastOcrText) {
+            console.log(`[LocalVision] Skipping frame ${i} (Duplicate OCR text)`);
+            continue;
+        }
+        lastOcrText = ocrText;
 
-This screenshot is from timestamp ${Math.round(frame.timestamp)}s.
+        const prompt = `You are a World-Class Technical Trainer. Create a professional SOP step for a tutorial titled "${segmentTitle}".
+ 
+Screenshot timestamp: ${Math.round(frame.timestamp)}s.
+OCR Text visible: "${ocrText.slice(0, 500)}"
 
-Based on this screenshot:
-1. Write a clear instruction for what the user should do.
-2. If there's any code/text to type, include it.
-3. Score this frame's "educational value" (is it a tutorial step or just fluff?). 
-   Respond with a "score" from 0 to 100.
+TASK:
+1. Write ONE clear, action-oriented instruction (e.g., Click, Enter, Navigate). 
+2. Use specific labels from the OCR text.
+3. If this frame is NOT a tutorial step (e.g. just a talking head, intro slide, or redundant), set score to 0.
+4. If it IS a valid step, set a score (0-100).
 
 Respond in JSON (no fences):
 {"instruction": "...", "codeOrPrompt": "...", "score": 80}`;
@@ -96,6 +106,13 @@ Respond in JSON (no fences):
 
             try {
                 const parsed = JSON.parse(cleaned);
+
+                // Skip fluff frames
+                if (parsed.score < 20) {
+                    console.log(`[LocalVision] Skipping frame ${i} (Low educational score: ${parsed.score})`);
+                    continue;
+                }
+
                 steps.push({
                     frameIndex: i,
                     instruction: parsed.instruction || 'Follow the step shown.',
@@ -105,6 +122,7 @@ Respond in JSON (no fences):
                 });
                 totalScore += (parsed.score || 50);
             } catch {
+                // Fallback for non-JSON response
                 steps.push({
                     frameIndex: i,
                     instruction: response.slice(0, 500),

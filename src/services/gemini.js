@@ -117,24 +117,34 @@ IMPORTANT: Return valid JSON only. No markdown fences. Escape all special charac
     // Parse JSON, stripping any markdown fences if present
     text = text.replace(/^```json\s*/, '').replace(/```\s*$/, '');
 
+    // Final attempt: Character-by-character cleanup for common formatting issues
     try {
-        return JSON.parse(text);
-    } catch (e) {
-        console.warn('Initial JSON parse failed, attempting cleanup...', e.message);
-        const firstBrace = text.indexOf('{');
-        const lastBrace = text.lastIndexOf('}');
-        if (firstBrace !== -1 && lastBrace !== -1) {
-            text = text.substring(firstBrace, lastBrace + 1);
+        // Fix common unescaped newlines in strings
+        const partiallyFixed = text.replace(/"description":\s*"(.*?)"/gs, (match, p1) => {
+            return `"description": "${p1.replace(/\n/g, ' ').replace(/"/g, '\\"')}"`;
+        });
+        return JSON.parse(partiallyFixed);
+    } catch (e3) {
+        console.error('Final JSON parse failed. Attempting partial recovery...', e3.message);
+
+        // Strategy: Recover segments that actually parsed before the error
+        const segments = [];
+        const segmentMatches = text.match(/{[\s\n]*"title":.*?"endTime":\s*\d+[\s\n]*}/gs);
+        if (segmentMatches) {
+            for (const s of segmentMatches) {
+                try {
+                    segments.push(JSON.parse(s));
+                } catch { }
+            }
         }
 
-        // Final attempt
-        try {
-            return JSON.parse(text);
-        } catch (e2) {
-            console.error('Final JSON parse failed. Raw response snippet:', text.slice(0, 500));
-            // Return a fallback segment if parsing fails but we want to continue
-            return { segments: [{ title: 'Main Lesson', description: 'Overview', startTime: 0, endTime: durationSeconds }] };
+        if (segments.length > 0) {
+            console.log(`[Gemini] Recovered ${segments.length} segments from malformed JSON.`);
+            return { segments };
         }
+
+        // Ultimate fallback
+        return { segments: [{ title: 'Main Lesson', description: 'Overview', startTime: 0, endTime: durationSeconds }] };
     }
 }
 
@@ -170,8 +180,8 @@ async function generateSopSteps(frames, transcriptSlice, segmentTitle, ocrTexts)
         })
         .join('\n');
 
-    const prompt = `You are creating a step-by-step SOP (Standard Operating Procedure) document for a tutorial segment titled "${segmentTitle}".
-
+    const prompt = `You are a World-Class Technical Trainer and SOP Architect. Your goal is to create a high-quality, professional Standard Operating Procedure (SOP) for a tutorial titled "${segmentTitle}".
+ 
 I'm providing you with ${frames.length} screenshots from the video at different timestamps, plus the transcript of this segment.
 I've also run OCR on each frame to extract visible text, which is shown alongside the frame descriptions.
 
@@ -181,32 +191,36 @@ ${frameDescriptions}
 TRANSCRIPT SLICE:
 ${transcriptSlice}
 
-YOUR TASK:
-1. Annotate clear, actionable SOP steps.
-2. Evaluate if this clip is actually a functional tutorial (something someone can follow).
-   Assign a "tutorialScore" from 0 to 100.
-   - 100: A clear screen-share or demo with specific steps.
-   - 50: A mix of talking and high-level demo.
-   - 0: Just a person talking, a movie scene, or random footage with no educational value.
+YOUR GOAL:
+1. Identify the ESSENTIAL steps required to reproduce the actions in this clip.
+2. CRITICAL: Avoid redundancy. Do NOT create steps for frames that show the same information (e.g., intro slides, static transitions, or repetitive talking heads). 
+3. One frame should ideally represent one significant action. If multiple frames show the progress of the SAME action, pick the BEST single frame that captures the transition or the result.
+4. If a frame has no educational value (just a person's face, a generic logo, or a redundant slide), SKIP it entirely.
 
-Respond in this exact JSON format:
+STYLE GUIDELINES:
+- Use ACTION VERBS at the start of instructions (e.g., Click, Enter, Navigate, Select, Open).
+- Avoid passive phrases like "Observe", "Watch", or "Notice" unless it's a critical observation for the process.
+- Be concise but precise. Reference specific UI elements or text visible on screen.
+
+OUPUT FORMAT (JSON):
+Assign a "tutorialScore" (0-100) based on how well this clip functions as a tutorial (100 = clear demo, 0 = pure talk).
+
+Return JSON only:
 {
   "tutorialScore": 85,
   "steps": [
     {
       "frameIndex": 0,
-      "instruction": "Clear instruction text",
+      "instruction": "Click the 'Settings' icon in the top right corner.",
       "codeOrPrompt": "any code or text to type, or null if not applicable"
     }
   ]
 }
 
 RULES:
-- Steps should be in logical order
-- Each step should be ONE clear action
-- Be specific and precise
-- Use the OCR text to identify exact labels and code
-- Return ONLY valid JSON, no markdown fences.`;
+- Return ONLY valid JSON.
+- No markdown fences.
+- If no tutorial steps are found in this clip, return an empty "steps" array.`;
 
     const contentParts = [prompt, ...imageParts.map(ip => ip.part)];
     const result = await withRetry(() => model.generateContent(contentParts));
@@ -243,7 +257,53 @@ RULES:
     return { steps, tutorialScore: parsed.tutorialScore || 0 };
 }
 
+/**
+ * Segment an existing transcript into topics.
+ */
+async function segmentTranscript(transcript, durationSeconds) {
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+
+    const prompt = `You are an expert at topic segmentation.
+I have a transcript from a workshop/tutorial video (total duration: ${Math.round(durationSeconds)} seconds).
+
+TRANSCRIPT:
+${transcript.slice(0, 30000)}
+
+TASK: Identify the distinct topics or lessons being demonstrated.
+For each topic, provide:
+- A clear, descriptive title
+- A one-sentence description
+- The approximate start timestamp (in seconds)
+- The approximate end timestamp (in seconds)
+
+Respond ONLY with this exact JSON structure:
+{
+  "segments": [
+    {
+      "title": "...",
+      "description": "...",
+      "startTime": 0,
+      "endTime": 180
+    }
+  ]
+}
+
+IMPORTANT: Return valid JSON only. No markdown fences.`;
+
+    const result = await withRetry(() => model.generateContent(prompt));
+    let text = result.response.text().trim();
+    text = text.replace(/^```json\s*/, '').replace(/```\s*$/, '');
+
+    try {
+        return JSON.parse(text);
+    } catch (e) {
+        console.error('Segmenting JSON parse failed:', e.message);
+        return { segments: [{ title: 'Main Lesson', description: 'Overview', startTime: 0, endTime: durationSeconds }] };
+    }
+}
+
 module.exports = {
     transcribeAndSegment,
     generateSopSteps,
+    segmentTranscript,
 };
