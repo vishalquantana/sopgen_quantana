@@ -25,7 +25,7 @@ db.exec(`
     thumbnail_path TEXT,
     duration_seconds REAL,
     status TEXT NOT NULL DEFAULT 'uploaded'
-      CHECK(status IN ('uploaded','processing','transcribing','segmenting','generating_clips','generating_sops','complete','error')),
+      CHECK(status IN ('uploaded','processing','transcribing','segmenting','generating_clips','generating_sops','complete','error','paused')),
     error_message TEXT,
     transcript TEXT,
     pipeline_logs TEXT,
@@ -47,6 +47,7 @@ db.exec(`
     thumbnail_path TEXT,
     status TEXT NOT NULL DEFAULT 'pending'
       CHECK(status IN ('pending','processing','complete','error')),
+    tutorial_score INTEGER,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -115,6 +116,9 @@ const stmts = {
   `),
   updateClipStatus: db.prepare(`
     UPDATE clips SET status = @status WHERE id = @id
+  `),
+  updateClipScore: db.prepare(`
+    UPDATE clips SET tutorial_score = @score WHERE id = @id
   `),
 
   // SOP Steps

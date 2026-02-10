@@ -218,13 +218,43 @@ router.post('/:id/stop', async (req, res) => {
         const video = stmts.getVideo.get(req.params.id);
         if (!video) return res.status(404).json({ error: 'Video not found' });
 
-        if (!['uploaded', 'complete', 'error'].includes(video.status)) {
-            stmts.updateVideoStatus.run({ id: req.params.id, status: 'error' });
-            stmts.updateVideoError.run({ id: req.params.id, errorMessage: 'Processing stopped by user' });
-            stmts.addPipelineLog.run({ id: req.params.id, message: '🛑 Processing manually stopped by user.' });
+        if (!['uploaded', 'complete', 'error', 'paused'].includes(video.status)) {
+            // Set to paused instead of error, so it can be resumed
+            stmts.updateVideoStatus.run({ id: req.params.id, status: 'paused' });
+            stmts.addPipelineLog.run({ id: req.params.id, message: '⏸ Processing paused by user.' });
         }
 
-        res.json({ success: true, message: 'Stop signal sent' });
+        res.json({ success: true, message: 'Processing paused' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ---- POST /api/videos/:id/pause (alias for stop) ----
+router.post('/:id/pause', async (req, res) => {
+    return res.redirect(307, `./stop`);
+});
+
+// ---- POST /api/videos/:id/resume ----
+router.post('/:id/resume', async (req, res) => {
+    try {
+        const video = stmts.getVideo.get(req.params.id);
+        if (!video) return res.status(404).json({ error: 'Video not found' });
+
+        if (video.status !== 'paused' && video.status !== 'error') {
+            return res.status(400).json({ error: 'Video is not paused' });
+        }
+
+        // Reset status to allow processing
+        stmts.updateVideoStatus.run({ id: req.params.id, status: 'processing' });
+        stmts.addPipelineLog.run({ id: req.params.id, message: '▶ Resuming processing...' });
+
+        res.json({ status: 'processing', message: 'Resuming started' });
+
+        // Run pipeline in background
+        processVideo(req.params.id).catch(err => {
+            console.error('Pipeline error:', err);
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }

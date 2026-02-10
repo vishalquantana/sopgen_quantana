@@ -28,20 +28,96 @@ async function getVisionProvider() {
 }
 
 /**
- * Full processing pipeline for a video.
- * Runs asynchronously — updates DB status at each phase.
+ * Check if the video processing has been paused or stopped by user
  */
+function isAborted(videoId) {
+    const current = stmts.getVideo.get(videoId);
+    return current.status === 'paused' || current.status === 'error';
+}
+
 /**
- * Helper to log progress to DB and console
+ * Generate SOP for a single clip
  */
-function logProgress(videoId, message) {
-    const ts = new Date().toLocaleTimeString();
-    const formatted = `[${ts}] ${message}`;
-    console.log(`[Pipeline][${videoId}] ${message}`);
+async function generateSopForClip(videoId, seg, videoFilePath, duration, transcript, visionProvider) {
+    const clipId = seg.id;
+
+    // Check if SOP steps already exist
+    const existingSteps = stmts.getSopStepsByClip.all(clipId);
+    if (existingSteps.length > 0) {
+        return;
+    }
+
+    logProgress(videoId, `Generating SOP for clip "${seg.title}"...`);
+
+    const startTime = Math.max(0, seg.startTime);
+    const endTime = Math.min(duration, seg.endTime);
+    const clipDuration = endTime - startTime;
+    const numFrames = Math.min(Math.max(5, Math.ceil(clipDuration / 10)), 15);
+    const interval = clipDuration / numFrames;
+
+    const frames = [];
+    for (let j = 0; j < numFrames; j++) {
+        if (isAborted(videoId)) return;
+        const ts = startTime + (j * interval) + (interval / 2);
+        const frameName = `${clipId}_frame_${j}`;
+        try {
+            const framePath = await media.extractFrame(videoFilePath, ts, frameName);
+            frames.push({ timestamp: ts, path: framePath });
+        } catch (err) {
+            console.error(`[Pipeline] Failed to extract frame at ${ts}s:`, err.message);
+        }
+    }
+
+    if (frames.length === 0) {
+        logProgress(videoId, `No frames extracted for clip "${seg.title}", skipping SOP.`);
+        return;
+    }
+
+    logProgress(videoId, `Running OCR on ${frames.length} frames...`);
+    const ocrResults = await ocr.extractTextBatch(frames.map(f => f.path));
+    const ocrTexts = ocrResults.map(r => r.text);
+
+    const transcriptSlice = (transcript || '').split('\n')
+        .filter(line => {
+            const match = line.match(/\[(\d+):(\d+)\]/);
+            if (!match) return false;
+            const timeSec = parseInt(match[1]) * 60 + parseInt(match[2]);
+            return timeSec >= startTime && timeSec <= endTime;
+        })
+        .join('\n') || `Transcript for segment: ${seg.title}`;
+
     try {
-        stmts.addPipelineLog.run({ id: videoId, message: formatted });
-    } catch (e) {
-        console.error('Failed to log progress to DB:', e.message);
+        let result;
+        if (visionProvider === 'local') {
+            result = await localVision.generateSopStepsLocal(frames, transcriptSlice, seg.title, ocrTexts);
+        } else {
+            result = await gemini.generateSopSteps(frames, transcriptSlice, seg.title, ocrTexts);
+        }
+
+        const { steps, tutorialScore } = result;
+
+        // Store steps
+        for (let s = 0; s < steps.length; s++) {
+            const step = steps[s];
+            stmts.insertSopStep.run({
+                id: uuid(),
+                clipId: clipId,
+                stepNumber: s + 1,
+                timestamp: step.timestamp,
+                screenshotPath: step.screenshotPath ? path.relative(DATA_DIR, step.screenshotPath) : null,
+                instruction: step.instruction,
+                codeOrPrompt: step.codeOrPrompt || null,
+            });
+        }
+
+        // Store score
+        if (tutorialScore !== undefined) {
+            stmts.updateClipScore.run({ id: clipId, score: tutorialScore });
+        }
+
+        logProgress(videoId, `Generated ${steps.length} SOP steps for clip "${seg.title}" (Tutorial Score: ${tutorialScore || 'N/A'}%)`);
+    } catch (err) {
+        logProgress(videoId, `Error generating SOP for clip "${seg.title}": ${err.message}`);
     }
 }
 
@@ -57,6 +133,11 @@ async function processVideo(videoId) {
     logProgress(videoId, `Starting pipeline (Provider: ${visionProvider})`);
 
     try {
+        if (isAborted(videoId)) {
+            logProgress(videoId, "Pipeline aborted before start.");
+            return;
+        }
+
         // === PHASE 1: Extract audio and transcribe ===
         const duration = await media.getVideoDuration(video.file_path);
 
@@ -64,7 +145,7 @@ async function processVideo(videoId) {
         const estimateMs = 60000 + (duration * 600);
         const estimatedFinishAt = new Date(Date.now() + estimateMs).toISOString();
         stmts.updateVideoEstimate.run({ id: videoId, estimateAt: estimatedFinishAt });
-        logProgress(videoId, `Estimated completion time: ${Math.ceil(estimateMs / 60000)} minutes`);
+        // logProgress(videoId, `Estimated completion time: ${Math.ceil(estimateMs / 60000)} minutes`);
 
         // Update meta if needed
         if (video.title === 'Untitled' || !video.thumbnail_path) {
@@ -82,14 +163,15 @@ async function processVideo(videoId) {
 
         if (transcript) {
             logProgress(videoId, "Found existing transcript, skipping Phase 1.");
-            // We need segments even if we have a transcript. 
-            // In a real resumable system we might store segments in DB. 
-            // For now, if we have transcript but no clips, we might need to re-segment or check clips table.
+            // We still need segments to know what to process
+            // If we have clips in DB, we'll use them. If not, we'd need to re-segment.
         } else {
+            if (isAborted(videoId)) return;
             stmts.updateVideoStatus.run({ id: videoId, status: 'transcribing' });
             logProgress(videoId, "Phase 1: Extracting audio...");
             const audioPath = await media.extractAudio(video.file_path, videoId);
 
+            if (isAborted(videoId)) return;
             logProgress(videoId, "Phase 1: Transcribing with Gemini...");
             const result = await gemini.transcribeAndSegment(audioPath, duration);
             transcript = result.transcript;
@@ -99,17 +181,11 @@ async function processVideo(videoId) {
             logProgress(videoId, `Phase 1 complete. Found ${segments.length} segments.`);
         }
 
-        // === PHASE 2: Generate clips ===
-        // If we don't have segments in memory (skipped phase 1), segments will be empty.
-        // We should check the clips table to see what's already done.
+        // === PHASE 2: Generate clips AND SOPs per-clip ===
         const existingClips = stmts.getClipsByVideo.all(videoId);
 
-        // If we skipped Phase 1 but have no clips, we actually DO need to re-segment to know what clips to make.
-        // For simplicity in this iteration: if clips exist, we skip Phase 2 for THOSE clips.
-
         if (segments.length === 0 && existingClips.length > 0) {
-            logProgress(videoId, `Found ${existingClips.length} existing clips, resuming from there.`);
-            // Mock segments from existing clips for Phase 3
+            logProgress(videoId, `Found ${existingClips.length} existing clips, resuming...`);
             segments = existingClips.map(c => ({
                 title: c.title,
                 description: c.description,
@@ -117,30 +193,21 @@ async function processVideo(videoId) {
                 endTime: c.end_time,
                 id: c.id
             }));
-        } else if (segments.length > 0) {
+        }
+
+        if (segments.length > 0) {
+            stmts.updateVideoStatus.run({ id: videoId, status: 'processing' });
+
             for (let i = 0; i < segments.length; i++) {
-                // Cancellation check
-                const current = stmts.getVideo.get(videoId);
-                if (current.status === 'error') {
-                    console.log(`[Pipeline][${videoId}] Cancellation detected in Phase 2. Aborting.`);
+                if (isAborted(videoId)) {
+                    logProgress(videoId, "Aborted during clip processing.");
                     return;
                 }
 
                 const seg = segments[i];
-
-                // Check if this clip index already exists
                 const existing = existingClips.find(c => c.clip_index === i + 1);
-                if (existing && existing.status === 'complete') {
-                    logProgress(videoId, `Clip ${i + 1} already exists and is complete, skipping.`);
-                    seg.id = existing.id;
-                    continue;
-                }
-
                 const clipId = existing ? existing.id : uuid();
                 seg.id = clipId;
-
-                const startTime = Math.max(0, seg.startTime);
-                const endTime = Math.min(duration, seg.endTime);
 
                 if (!existing) {
                     stmts.insertClip.run({
@@ -149,122 +216,110 @@ async function processVideo(videoId) {
                         clipIndex: i + 1,
                         title: seg.title,
                         description: seg.description,
-                        startTime,
-                        endTime,
+                        startTime: Math.max(0, seg.startTime),
+                        endTime: Math.min(duration, seg.endTime),
                     });
                 }
 
-                logProgress(videoId, `Generating clip ${i + 1}/${segments.length}: ${seg.title}`);
+                // Skip clip generation if already done
+                if (!existing || existing.status !== 'complete') {
+                    logProgress(videoId, `Generating clip ${i + 1}/${segments.length}: ${seg.title}`);
+                    try {
+                        const clipPath = await media.generateClip(video.file_path, seg.startTime, seg.endTime, clipId);
+                        const clipThumbPath = await media.generateThumbnail(clipPath, `clip_${clipId}`);
 
-                try {
-                    const clipPath = await media.generateClip(video.file_path, startTime, endTime, clipId);
-                    const clipThumbPath = await media.generateThumbnail(clipPath, `clip_${clipId}`);
-
-                    stmts.updateClipFile.run({
-                        id: clipId,
-                        filePath: path.relative(DATA_DIR, clipPath),
-                        thumbnailPath: path.relative(DATA_DIR, clipThumbPath),
-                    });
-                } catch (err) {
-                    logProgress(videoId, `Error matching clip ${i + 1}: ${err.message}`);
-                    stmts.updateClipStatus.run({ id: clipId, status: 'error' });
-                }
-            }
-        }
-
-        // === PHASE 3: Generate SOPs for each clip ===
-        stmts.updateVideoStatus.run({ id: videoId, status: 'generating_sops' });
-
-        for (let i = 0; i < segments.length; i++) {
-            // Cancellation check
-            const current = stmts.getVideo.get(videoId);
-            if (current.status === 'error') {
-                console.log(`[Pipeline][${videoId}] Cancellation detected in Phase 3. Aborting.`);
-                return;
-            }
-
-            const seg = segments[i];
-            const clipId = seg.id;
-
-            // Check if SOP steps already exist
-            const existingSteps = stmts.getSopStepsByClip.all(clipId);
-            if (existingSteps.length > 0) {
-                logProgress(videoId, `SOP for clip ${i + 1} already exists, skipping.`);
-                continue;
-            }
-
-            logProgress(videoId, `Phase 3: Generating SOP ${i + 1}/${segments.length} ("${seg.title}")`);
-
-            const startTime = Math.max(0, seg.startTime);
-            const endTime = Math.min(duration, seg.endTime);
-            const clipDuration = endTime - startTime;
-            const numFrames = Math.min(Math.max(5, Math.ceil(clipDuration / 10)), 15);
-            const interval = clipDuration / numFrames;
-
-            const frames = [];
-            for (let j = 0; j < numFrames; j++) {
-                const ts = startTime + (j * interval) + (interval / 2);
-                const frameName = `${clipId}_frame_${j}`;
-                try {
-                    const framePath = await media.extractFrame(video.file_path, ts, frameName);
-                    frames.push({ timestamp: ts, path: framePath });
-                } catch (err) {
-                    console.error(`[Pipeline] Failed to extract frame at ${ts}s:`, err.message);
-                }
-            }
-
-            if (frames.length === 0) {
-                logProgress(videoId, `No frames for clip ${i + 1}, skipping SOP.`);
-                continue;
-            }
-
-            logProgress(videoId, `Running OCR on ${frames.length} frames...`);
-            const ocrResults = await ocr.extractTextBatch(frames.map(f => f.path));
-            const ocrTexts = ocrResults.map(r => r.text);
-
-            const transcriptSlice = (transcript || '').split('\n')
-                .filter(line => {
-                    const match = line.match(/\[(\d+):(\d+)\]/);
-                    if (!match) return false;
-                    const timeSec = parseInt(match[1]) * 60 + parseInt(match[2]);
-                    return timeSec >= startTime && timeSec <= endTime;
-                })
-                .join('\n') || `Transcript for segment: ${seg.title}`;
-
-            try {
-                let sopSteps;
-                if (visionProvider === 'local') {
-                    sopSteps = await localVision.generateSopStepsLocal(frames, transcriptSlice, seg.title, ocrTexts);
-                } else {
-                    sopSteps = await gemini.generateSopSteps(frames, transcriptSlice, seg.title, ocrTexts);
+                        stmts.updateClipFile.run({
+                            id: clipId,
+                            filePath: path.relative(DATA_DIR, clipPath),
+                            thumbnailPath: path.relative(DATA_DIR, clipThumbPath),
+                        });
+                    } catch (err) {
+                        logProgress(videoId, `Error generating clip ${i + 1}: ${err.message}`);
+                        stmts.updateClipStatus.run({ id: clipId, status: 'error' });
+                        // Continue to next clip
+                    }
                 }
 
-                for (let s = 0; s < sopSteps.length; s++) {
-                    const step = sopSteps[s];
-                    stmts.insertSopStep.run({
-                        id: uuid(),
-                        clipId: clipId,
-                        stepNumber: s + 1,
-                        timestamp: step.timestamp,
-                        screenshotPath: step.screenshotPath ? path.relative(DATA_DIR, step.screenshotPath) : null,
-                        instruction: step.instruction,
-                        codeOrPrompt: step.codeOrPrompt || null,
-                    });
+                // Immediately Generate SOP for this clip
+                if (!isAborted(videoId)) {
+                    try {
+                        await generateSopForClip(videoId, seg, video.file_path, duration, transcript, visionProvider);
+                    } catch (err) {
+                        logProgress(videoId, `Error in SOP phase for clip ${i + 1}: ${err.message}`);
+                    }
                 }
-                logProgress(videoId, `Generated ${sopSteps.length} SOP steps for clip ${i + 1}`);
-            } catch (err) {
-                logProgress(videoId, `Error generating SOP for clip ${i + 1}: ${err.message}`);
             }
         }
 
         // === COMPLETE ===
-        stmts.updateVideoStatus.run({ id: videoId, status: 'complete' });
-        logProgress(videoId, "Processing complete! 🎉");
+        if (!isAborted(videoId)) {
+            stmts.updateVideoStatus.run({ id: videoId, status: 'complete' });
+            logProgress(videoId, "Processing complete! 🎉");
+        }
     } catch (err) {
-        logProgress(videoId, `FATAL ERROR: ${err.message}`);
-        stmts.updateVideoError.run({ id: videoId, errorMessage: err.message });
-        throw err;
-    }
-}
+        if (!isAborted(videoId)) {
+            logProgress(videoId, `FATAL ERROR: ${err.message}`);
+            stmts.updateVideoError.run({ id: videoId, errorMessage: err.message });
+            logProgress(videoId, `Regenerating tutorial scores for ${clips.length} clips...`);
 
-module.exports = { processVideo };
+            for (const clip of clips) {
+                if (isAborted(videoId)) return;
+
+                logProgress(videoId, `Scoring clip: ${clip.title}`);
+
+                // We reuse the generateSopForClip logic but we'll modify it slightly 
+                // Or just re-run it — since it skips steps if they exist, it's safe.
+                // HOWEVER, our current generateSopForClip returns early if steps exist.
+                // Let's make a dedicated scoring function if we want to be efficient.
+
+                const startTime = Math.max(0, clip.start_time);
+                const endTime = Math.min(video.duration_seconds, clip.end_time);
+                const clipDuration = endTime - startTime;
+                const numFrames = 5; // Fewer frames for just scoring
+                const interval = clipDuration / numFrames;
+
+                const frames = [];
+                for (let j = 0; j < numFrames; j++) {
+                    const ts = startTime + (j * interval) + (interval / 2);
+                    const frameName = `score_${clip.id}_${j}`;
+                    try {
+                        const framePath = await media.extractFrame(video.file_path, ts, frameName);
+                        frames.push({ timestamp: ts, path: framePath });
+                    } catch (e) { }
+                }
+
+                if (frames.length === 0) continue;
+
+                try {
+                    // Transcript slice
+                    const transcriptSlice = (video.transcript || '').split('\n')
+                        .filter(line => {
+                            const match = line.match(/\[(\d+):(\d+)\]/);
+                            if (!match) return false;
+                            const timeSec = parseInt(match[1]) * 60 + parseInt(match[2]);
+                            return timeSec >= startTime && timeSec <= endTime;
+                        })
+                        .join('\n');
+
+                    let result;
+                    if (visionProvider === 'local') {
+                        result = await localVision.generateSopStepsLocal(frames, transcriptSlice, clip.title);
+                    } else {
+                        result = await gemini.generateSopSteps(frames, transcriptSlice, clip.title);
+                    }
+
+                    if (result.tutorialScore !== undefined) {
+                        stmts.updateClipScore.run({ id: clip.id, score: result.tutorialScore });
+                        logProgress(videoId, `Score for "${clip.title}": ${result.tutorialScore}%`);
+                    }
+                } catch (err) {
+                    logProgress(videoId, `Failed to score "${clip.title}": ${err.message}`);
+                }
+            }
+            logProgress(videoId, "Score regeneration complete.");
+        }
+
+        module.exports = {
+            processVideo,
+            regenerateScores,
+        };

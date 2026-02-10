@@ -70,6 +70,7 @@ function statusLabel(status) {
     generating_sops: 'Generating SOPs',
     complete: 'Complete',
     error: 'Error',
+    paused: 'Paused',
   };
   return labels[status] || status;
 }
@@ -93,7 +94,7 @@ function showToast(message, type = 'info') {
 // ---- Router ----
 const router = {
   routes: {},
-  register(path, handler) { this.routes[path] = handler; },
+  register(path, handler) { this.routes[patternToRegex(path)] = handler; },
   navigate(path) { window.location.hash = path; },
   init() {
     window.addEventListener('hashchange', () => this.resolve());
@@ -107,39 +108,72 @@ const router = {
     });
 
     // Match route
-    for (const [pattern, handler] of Object.entries(this.routes)) {
-      const regex = new RegExp('^' + pattern.replace(/:\w+/g, '([^/]+)') + '$');
-      const match = hash.match(regex);
+    for (const [regex, handler] of Object.entries(this.routes)) {
+      const match = hash.match(new RegExp(regex));
       if (match) {
         handler(...match.slice(1));
         return;
       }
     }
     // Fallback
-    this.routes['/']?.();
+    renderDashboard();
   },
 };
+function patternToRegex(pattern) {
+  return '^' + pattern.replace(/:\w+/g, '([^/]+)') + '$';
+}
 
 // ---- Polling Manager ----
-let pollIntervals = {};
-function startPolling(videoId, callback, interval = 3000) {
-  stopPolling(videoId);
-  pollIntervals[videoId] = setInterval(callback, interval);
-}
-function stopPolling(videoId) {
-  if (pollIntervals[videoId]) {
-    clearInterval(pollIntervals[videoId]);
-    delete pollIntervals[videoId];
+let activePolls = {};
+let isConfirming = false; // Global flag to block polling re-renders
+
+async function poll(videoId, callback, interval = 3000, errorCount = 0) {
+  if (!activePolls[videoId]) return;
+
+  // Wait if user is confirming something
+  if (isConfirming) {
+    activePolls[videoId] = setTimeout(() => poll(videoId, callback, interval, errorCount), 1000);
+    return;
+  }
+
+  try {
+    const shouldContinue = await callback();
+    if (activePolls[videoId] && shouldContinue) {
+      activePolls[videoId] = setTimeout(() => poll(videoId, callback, interval, 0), interval);
+    }
+  } catch (err) {
+    console.error(`Poll error [${videoId}]:`, err);
+    errorCount++;
+    // Exponential backoff
+    const nextInterval = Math.min(interval * Math.pow(2, errorCount), 30000);
+    if (activePolls[videoId]) {
+      activePolls[videoId] = setTimeout(() => poll(videoId, callback, interval, errorCount), nextInterval);
+    }
   }
 }
+
+function startPolling(videoId, callback, interval = 3000) {
+  stopPolling(videoId);
+  activePolls[videoId] = true; // Placeholder
+  poll(videoId, callback, interval);
+}
+
+function stopPolling(videoId) {
+  if (activePolls[videoId]) {
+    clearTimeout(activePolls[videoId]);
+    delete activePolls[videoId];
+  }
+}
+
 function stopAllPolling() {
-  Object.keys(pollIntervals).forEach(stopPolling);
+  Object.keys(activePolls).forEach(stopPolling);
 }
 
 // ---- Views ----
 
 // Dashboard
 async function renderDashboard() {
+  stopAllPolling();
   const app = document.getElementById('app');
   app.innerHTML = `
     <div class="page-header">
@@ -178,7 +212,7 @@ async function renderDashboard() {
     </div>
   `;
 
-  // Initialize Upload/YouTube Listeners
+  // Initialize Listeners
   const dropzone = document.getElementById('dropzone');
   const fileInput = document.getElementById('file-input');
   const ytInput = document.getElementById('youtube-url-dash');
@@ -197,10 +231,8 @@ async function renderDashboard() {
   ytBtn.addEventListener('click', () => {
     const url = ytInput.value.trim();
     if (!url) { showToast('Please enter a YouTube URL', 'error'); return; }
-
     ytBtn.disabled = true;
     ytBtn.textContent = 'Downloading...';
-
     api.post('/api/videos/youtube', { url })
       .then(result => {
         showToast('YouTube download started!', 'success');
@@ -218,35 +250,23 @@ async function renderDashboard() {
     const container = document.getElementById('video-list');
 
     if (videos.length === 0) {
-      container.innerHTML = `
-        <div class="empty-state">
-          <div class="empty-state-icon">🎬</div>
-          <h3>No videos yet</h3>
-          <p>The list is empty. Start by uploading above!</p>
-        </div>
-      `;
+      container.innerHTML = `<div class="empty-state"><div class="empty-state-icon">🎬</div><h3>No videos yet</h3><p>Start by uploading above!</p></div>`;
       return;
     }
 
     container.innerHTML = `<div class="video-grid">${videos.map(v => videoCard(v)).join('')}</div>`;
 
-    // Start polling for processing videos
-    videos.filter(v => !['uploaded', 'complete', 'error'].includes(v.status)).forEach(v => {
+    // Start polling for active ones
+    videos.filter(v => ['processing', 'transcribing', 'segmenting', 'generating_clips', 'generating_sops'].includes(v.status)).forEach(v => {
       startPolling(v.id, async () => {
-        try {
-          const updated = await api.get(`/api/videos/${v.id}`);
-          const card = document.querySelector(`[data-video-id="${v.id}"]`);
-          if (card) {
-            card.outerHTML = videoCard(updated);
-          }
-          if (['complete', 'error'].includes(updated.status)) {
-            stopPolling(v.id);
-          }
-        } catch (e) { /* ignore */ }
+        const updated = await api.get(`/api/videos/${v.id}`);
+        const card = document.querySelector(`[data-video-id="${v.id}"]`);
+        if (card) card.outerHTML = videoCard(updated);
+        return !['complete', 'error', 'paused'].includes(updated.status);
       });
     });
   } catch (err) {
-    document.getElementById('video-list').innerHTML = `<div class="empty-state"><p style="color:var(--error)">Failed to load videos: ${escapeHtml(err.message)}</p></div>`;
+    document.getElementById('video-list').innerHTML = `<p style="color:var(--error); text-align:center;">Failed to load: ${escapeHtml(err.message)}</p>`;
   }
 }
 
@@ -319,29 +339,19 @@ function renderUpload() {
 }
 
 async function handleFileUpload(file) {
-  const progressDiv = document.getElementById('upload-progress');
-  const fileNameEl = document.getElementById('upload-file-name');
-  const percentEl = document.getElementById('upload-percent');
-  const barEl = document.getElementById('upload-bar');
-
-  progressDiv.style.display = 'block';
-  fileNameEl.textContent = file.name;
-
+  const p = document.getElementById('upload-progress');
+  p.style.display = 'block';
+  document.getElementById('upload-file-name').textContent = file.name;
   const formData = new FormData();
   formData.append('video', file);
   formData.append('title', file.name.replace(/\.[^/.]+$/, ''));
-
   try {
-    const result = await api.upload('/api/videos/upload', formData, (pct) => {
-      percentEl.textContent = pct + '%';
-      barEl.style.width = pct + '%';
+    const res = await api.upload('/api/videos/upload', formData, (pct) => {
+      document.getElementById('upload-percent').textContent = pct + '%';
+      document.getElementById('upload-bar').style.width = pct + '%';
     });
-    showToast('Video uploaded successfully!', 'success');
-    router.navigate(`/video/${result.id}`);
-  } catch (err) {
-    showToast('Upload failed: ' + err.message, 'error');
-    progressDiv.style.display = 'none';
-  }
+    router.navigate(`/video/${res.id}`);
+  } catch (e) { showToast(e.message, 'error'); p.style.display = 'none'; }
 }
 
 async function handleYoutube() {
@@ -369,131 +379,74 @@ async function handleYoutube() {
 async function renderVideoDetail(videoId) {
   stopAllPolling();
   const app = document.getElementById('app');
-  app.innerHTML = `<div class="empty-state"><div class="spinner" style="width:32px;height:32px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 1rem;"></div><p>Loading video...</p></div>`;
+  app.innerHTML = `<div class="empty-state"><div class="spinner"></div><p>Loading video...</p></div>`;
 
   try {
     const video = await api.get(`/api/videos/${videoId}`);
     renderVideoDetailContent(video);
 
-    // Poll if processing
-    if (!['uploaded', 'complete', 'error'].includes(video.status)) {
+    if (!['uploaded', 'complete', 'error', 'paused'].includes(video.status)) {
       startPolling(videoId, async () => {
-        if (isConfirming) return; // Skip polling while user is interacting with a dialog
-        try {
-          const updated = await api.get(`/api/videos/${videoId}`);
-          if (isConfirming) return; // Re-check after async op
-          renderVideoDetailContent(updated);
-          if (['uploaded', 'complete', 'error'].includes(updated.status)) {
-            stopPolling(videoId);
-            if (updated.status === 'complete') showToast('Processing complete! 🎉', 'success');
-          }
-        } catch (e) { /* ignore */ }
+        const updated = await api.get(`/api/videos/${videoId}`);
+        renderVideoDetailContent(updated);
+        return !['uploaded', 'complete', 'error', 'paused'].includes(updated.status);
       });
     }
   } catch (err) {
-    app.innerHTML = `<div class="empty-state"><p style="color:var(--error)">Failed to load video: ${escapeHtml(err.message)}</p><br><a href="#/" class="btn btn-secondary">← Back</a></div>`;
+    app.innerHTML = `<div class="empty-state"><p style="color:var(--error)">${escapeHtml(err.message)}</p><br><a href="#/" class="btn btn-secondary">← Back</a></div>`;
   }
 }
 
 function renderVideoDetailContent(video) {
+  // Prevent re-rendering while user is in a modal/confirm
+  if (isConfirming) return;
+
   const app = document.getElementById('app');
-  const isProcessing = !['uploaded', 'complete', 'error'].includes(video.status);
+  const isProcessing = ['processing', 'transcribing', 'segmenting', 'generating_clips', 'generating_sops'].includes(video.status);
   const clips = video.clips || [];
 
   let clipsHtml = '';
-  if (isProcessing) {
+  if (isProcessing || video.status === 'paused') {
     const statusMessages = {
       processing: 'Preparing video...',
-      transcribing: 'Transcribing audio with AI...',
-      segmenting: 'Identifying topics and segments...',
-      generating_clips: 'Generating video clips...',
-      generating_sops: 'Creating SOP documents...',
+      transcribing: 'Transcribing audio...',
+      segmenting: 'Segmenting topics...',
+      generating_clips: 'Generating clips...',
+      generating_sops: 'Creating SOPs...',
+      paused: 'Processing paused.',
     };
 
-    // Split logs and show last 10
-    const logs = (video.pipeline_logs || '').split('\n').filter(Boolean);
-    const recentLogs = logs.slice(-10).reverse();
-
-    // Look for download progress in logs
-    let progressHtml = '';
-    const lastLogWithDownload = [...logs].reverse().find(l => l.includes('Downloading:'));
-    if (lastLogWithDownload) {
-      const pctMatch = lastLogWithDownload.match(/Downloading:\s+(\d+\.\d+)%/);
-      if (pctMatch) {
-        const pct = pctMatch[1];
-        progressHtml = `
-          <div class="download-progress-status" style="margin-bottom: 2rem;">
-            <div style="display:flex; justify-content:space-between; font-size:0.9rem; margin-bottom:0.5rem; color:var(--text-secondary);">
-              <span>Downloading from YouTube...</span>
-              <span>${pct}%</span>
-            </div>
-            <div class="progress-bar"><div class="progress-bar-fill" style="width:${pct}%"></div></div>
-          </div>
-        `;
-      }
-    }
-
-    // Estimate remaining time
-    let estimateHtml = '';
-    if (video.estimated_finish_at) {
-      const finishTs = new Date(video.estimated_finish_at).getTime();
-      const now = Date.now();
-      const diffMin = Math.ceil((finishTs - now) / 60000);
-
-      if (diffMin > 0) {
-        estimateHtml = `
-          <div class="estimate-badge" style="display:inline-flex; align-items:center; gap:0.5rem; background:rgba(255,255,255,0.05); padding:0.4rem 0.8rem; border-radius:20px; font-size:0.85rem; color:var(--text-secondary); margin-bottom:1rem;">
-            <span style="display:block; width:8px; height:8px; background:var(--accent); border-radius:50%; animation: pulse 2s infinite;"></span>
-            Roughly ${diffMin} ${diffMin === 1 ? 'minute' : 'minutes'} remaining
-          </div>
-        `;
-      }
-    }
+    const logs = (video.pipeline_logs || '').split('\n').filter(Boolean).slice(-8).reverse();
 
     clipsHtml = `
       <div class="card processing-status">
-        <div class="spinner"></div>
+        <div class="${video.status === 'paused' ? '' : 'spinner'}"></div>
         <h3>${statusMessages[video.status] || 'Processing...'}</h3>
-        <p>Processing continues in the background. You can leave this page.</p>
-        
-        ${estimateHtml}
-        ${progressHtml}
+        ${video.estimated_finish_at && video.status !== 'paused' ? `
+          <div class="estimate-badge">Roughly ${Math.ceil((new Date(video.estimated_finish_at) - Date.now()) / 60000)}m remaining</div>
+        ` : ''}
+        <div class="pipeline-logs">
+          ${logs.map(log => `<div class="log-entry">${escapeHtml(log)}</div>`).join('')}
+        </div>
+      </div>
+    `;
+  }
 
-        <div class="pipeline-logs-container">
-          <h4>Recent Activity</h4>
-          <div class="pipeline-logs">
-            ${recentLogs.length > 0 ? recentLogs.map(log => `
-              <div class="log-entry">${escapeHtml(log)}</div>
-            `).join('') : '<div class="log-entry-muted">Waiting for updates...</div>'}
-          </div>
-        </div>
-      </div>
-    `;
-  } else if (video.status === 'error') {
-    clipsHtml = `
-      <div class="card" style="border-color: rgba(239,68,68,0.3);">
-        <h3 style="color:var(--error);">⚠ Processing Error</h3>
-        <p style="color:var(--text-secondary); margin-top:0.5rem;">${escapeHtml(video.error_message)}</p>
-        <div class="pipeline-logs-container" style="margin-top:1rem;">
-          <h4>Error Details</h4>
-          <div class="pipeline-logs">
-            ${(video.pipeline_logs || '').split('\n').slice(-5).reverse().map(l => `<div class="log-entry">${escapeHtml(l)}</div>`).join('')}
-          </div>
-        </div>
-      </div>
-    `;
-  } else if (video.status === 'complete' && clips.length > 0) {
-    clipsHtml = `
+  // Show clips even during processing (Real-time queue)
+  if (clips.length > 0) {
+    clipsHtml += `
       <div class="clips-section">
-        <h2>Generated Clips & SOPs (${clips.length})</h2>
+        <h2>${video.status === 'complete' ? '' : 'In-Progress '}Clips & SOPs (${clips.length})</h2>
         <div class="clip-list">
           ${clips.map(clip => `
             <div class="card clip-item" onclick="router.navigate('/sop/${clip.id}')">
               <div class="clip-number">${clip.clip_index}</div>
               <div class="clip-info">
                 <h3>${escapeHtml(clip.title)}</h3>
-                <p>${escapeHtml(clip.description || '')}</p>
-                <span class="clip-time">${formatDuration(clip.start_time)} → ${formatDuration(clip.end_time)} (${formatDuration(clip.end_time - clip.start_time)})</span>
+                <span class="clip-time">${formatDuration(clip.start_time)} → ${formatDuration(clip.end_time)}</span>
+                <div style="margin-top:0.4rem;">
+                    ${clip.tutorial_score !== null ? `<span style="font-size:0.8rem; color:var(--accent); font-weight:600;">🎓 ${clip.tutorial_score}% Tutorial Score</span>` : ''}
+                </div>
               </div>
               <span class="badge badge-${clip.status}">${clip.sopSteps?.length || 0} steps</span>
             </div>
@@ -501,95 +454,60 @@ function renderVideoDetailContent(video) {
         </div>
       </div>
     `;
-  } else if (video.status === 'complete') {
-    clipsHtml = `<div class="empty-state"><p>Processing complete but no clips were generated. The video may be too short or unclear.</p></div>`;
   }
 
   app.innerHTML = `
-    <div class="breadcrumb">
-      <a href="#/">Dashboard</a> <span>›</span> <span>${escapeHtml(video.title)}</span>
-    </div>
+    <div class="breadcrumb"><a href="#/">Dashboard</a> <span>›</span> ${escapeHtml(video.title)}</div>
     <div class="detail-header">
       <h1>${escapeHtml(video.title)}</h1>
       <div class="detail-meta">
         <span class="badge badge-${video.status}">${statusLabel(video.status)}</span>
-        ${video.duration_seconds ? `<span>⏱ ${formatDuration(video.duration_seconds)}</span>` : ''}
-        ${video.video_size_mb ? `<span>📦 ${Math.round(video.video_size_mb)} MB</span>` : ''}
+        <span>⏱ ${formatDuration(video.duration_seconds)}</span>
         <span>${formatDate(video.created_at)}</span>
-        ${video.source_url ? `<span>🔗 YouTube</span>` : '<span>📁 Uploaded</span>'}
       </div>
-      <div class="detail-actions" style="display:flex; align-items:center; gap:0.5rem;">
-        ${video.status === 'uploaded' ? `<button class="btn btn-primary" onclick="processVideo('${video.id}')">🚀 Start Processing</button>` : ''}
-        ${video.status === 'error' && video.error_message === 'Processing stopped by user' ? `<button class="btn btn-primary" onclick="processVideo('${video.id}')">🔄 Resume Processing</button>` : ''}
-        ${video.status === 'error' && video.error_message !== 'Processing stopped by user' ? `<button class="btn btn-primary" onclick="processVideo('${video.id}')">🔄 Try Again</button>` : ''}
-        ${isProcessing ? `<button class="btn btn-danger btn-stop" onclick="stopProcessing('${video.id}')">🛑 Stop Processing</button>` : ''}
-        <button class="btn btn-danger btn-sm" style="background:transparent; border:1px solid rgba(239,68,68,0.3); color:rgba(239,68,68,0.8)" onclick="deleteVideo('${video.id}')">Delete</button>
+      <div class="detail-actions">
+        ${video.status === 'uploaded' ? `<button class="btn btn-primary" onclick="processVideo('${video.id}')">🚀 Start</button>` : ''}
+        ${video.status === 'paused' ? `<button class="btn btn-primary" onclick="resumeVideo('${video.id}')">▶ Resume</button>` : ''}
+        ${video.status === 'error' ? `<button class="btn btn-primary" onclick="processVideo('${video.id}')">🔄 Retry</button>` : ''}
+        ${isProcessing ? `<button class="btn btn-danger" onclick="pauseVideo('${video.id}')">⏸ Pause</button>` : ''}
+        <button class="btn btn-danger btn-sm" style="opacity:0.6;" onclick="deleteVideo('${video.id}')">Delete</button>
       </div>
     </div>
     ${clipsHtml}
   `;
 }
 
-async function processVideo(videoId) {
-  try {
-    await api.post(`/api/videos/${videoId}/process`);
-    showToast('Processing started!', 'info');
-    renderVideoDetail(videoId);
-  } catch (err) {
-    showToast('Failed to start processing: ' + err.message, 'error');
-  }
+// Handlers
+async function processVideo(id) {
+  try { await api.post(`/api/videos/${id}/process`); showToast('Processing started', 'info'); renderVideoDetail(id); }
+  catch (e) { showToast(e.message, 'error'); }
 }
-
-// ---- UI State ----
-let isConfirming = false;
-
-async function deleteVideo(videoId) {
+async function pauseVideo(id) {
   isConfirming = true;
-  const confirmed = confirm('Delete this video and all generated clips/SOPs?');
+  if (!confirm('Pause processing? You can resume later.')) { isConfirming = false; return; }
   isConfirming = false;
-
-  if (!confirmed) return;
-  try {
-    await api.del(`/api/videos/${videoId}`);
-    showToast('Video deleted', 'success');
-    router.navigate('/');
-  } catch (err) {
-    showToast('Delete failed: ' + err.message, 'error');
-  }
+  try { await api.post(`/api/videos/${id}/pause`); showToast('Paused', 'info'); renderVideoDetail(id); }
+  catch (e) { showToast(e.message, 'error'); }
 }
-
-async function stopProcessing(videoId) {
+async function resumeVideo(id) {
+  try { await api.post(`/api/videos/${id}/resume`); showToast('Resuming...', 'info'); renderVideoDetail(id); }
+  catch (e) { showToast(e.message, 'error'); }
+}
+async function deleteVideo(id) {
   isConfirming = true;
-  const confirmed = confirm('Stop processing this video? This will halt any ongoing AI work.');
+  if (!confirm('Delete this video forever?')) { isConfirming = false; return; }
   isConfirming = false;
-
-  if (!confirmed) return;
-  try {
-    const btn = document.querySelector('.btn-stop');
-    if (btn) btn.disabled = true;
-
-    await api.post(`/api/videos/${videoId}/stop`);
-    showToast('Processing stop signal sent', 'info');
-    const video = await api.get(`/api/videos/${videoId}`);
-    renderVideoDetailContent(video);
-  } catch (err) {
-    showToast('Failed to stop: ' + err.message, 'error');
-  }
-}
-
-function escapeForAttr(str) {
-  if (!str) return '';
-  return str.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$');
+  try { await api.del(`/api/videos/${id}`); showToast('Deleted', 'success'); router.navigate('/'); }
+  catch (e) { showToast(e.message, 'error'); }
 }
 
 // SOP Viewer
 async function renderSop(clipId) {
   stopAllPolling();
   const app = document.getElementById('app');
-  app.innerHTML = `<div class="empty-state"><div class="spinner" style="width:32px;height:32px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 1rem;"></div><p>Loading SOP...</p></div>`;
+  app.innerHTML = `<div class="empty-state"><div class="spinner"></div><p>Loading SOP...</p></div>`;
 
   try {
-    // We need to find which video this clip belongs to
     const videos = await api.get('/api/videos');
     let video, clip;
     for (const v of videos) {
@@ -597,127 +515,82 @@ async function renderSop(clipId) {
       const found = detail.clips?.find(c => c.id === clipId);
       if (found) { video = detail; clip = found; break; }
     }
-
-    if (!clip) { app.innerHTML = '<div class="empty-state"><p>SOP not found</p></div>'; return; }
+    if (!clip) { router.navigate('/'); return; }
 
     const steps = clip.sopSteps || [];
-    const clipVideoSrc = clip.file_path ? `/data/${clip.file_path}` : null;
-
-    // YouTube Jump Link Logic
-    let youtubeJumpLink = '';
-    if (video.source_url && (video.source_url.includes('youtube.com') || video.source_url.includes('youtu.be'))) {
-      const baseUrl = video.source_url.split('&t=')[0].split('?t=')[0];
-      const jumpUrl = `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}t=${Math.floor(clip.start_time)}`;
-      youtubeJumpLink = `
-        <a href="${jumpUrl}" target="_blank" class="youtube-jump-link" style="display:inline-flex; align-items:center; gap:0.5rem; color:var(--accent); text-decoration:none; font-size:0.9rem; margin-top:0.5rem; padding:0.4rem 0.8rem; background:rgba(255,255,255,0.05); border-radius:6px; transition: background 0.2s;">
-          <span style="font-size:1.1rem;">📺</span> View on YouTube at ${formatDuration(clip.start_time)}
-        </a>
-      `;
-    }
+    const jumpUrl = video.source_url ? `${video.source_url.split(/[&?][t]=/)[0]}${video.source_url.includes('?') ? '&' : '?'}t=${Math.floor(clip.start_time)}` : null;
 
     app.innerHTML = `
-      <div class="breadcrumb">
-        <a href="#/">Dashboard</a>
-        <span>›</span>
-        <a href="#/video/${video.id}">${escapeHtml(video.title)}</a>
-        <span>›</span>
-        <span>SOP: ${escapeHtml(clip.title)}</span>
-      </div>
-
+      <div class="breadcrumb"><a href="#/">Dashboard</a> <span>›</span> <a href="#/video/${video.id}">${escapeHtml(video.title)}</a> <span>›</span> SOP</div>
       <div class="sop-header">
         <div>
           <h1>${escapeHtml(clip.title)}</h1>
           <p>${escapeHtml(clip.description || '')}</p>
-          ${youtubeJumpLink}
+          ${jumpUrl ? `<a href="${jumpUrl}" target="_blank" class="youtube-jump-link">📺 View on YouTube at ${formatDuration(clip.start_time)}</a>` : ''}
         </div>
-        <div style="display:flex; flex-direction:column; align-items:flex-end; gap:0.5rem;">
-          <span class="badge badge-complete">${steps.length} steps</span>
-          <button class="btn btn-secondary btn-sm" onclick="exportSop('${clip.id}')">📥 Export SOP (ZIP)</button>
+        <div style="text-align:right">
+          <div style="margin-bottom:0.5rem">
+            ${clip.tutorial_score !== null ? `<span class="badge" style="background:var(--accent); color:white">${clip.tutorial_score}% Tutorial Match</span>` : ''}
+          </div>
+          <button class="btn btn-secondary btn-sm" onclick="exportSop('${clip.id}')">📥 Export ZIP</button>
         </div>
       </div>
 
-      ${clipVideoSrc ? `
-        <div class="sop-clip-player card-glass">
-          <video controls preload="metadata">
-            <source src="${clipVideoSrc}" type="video/mp4">
-          </video>
-        </div>
-      ` : ''}
+      ${clip.file_path ? `<div class="sop-clip-player card-glass"><video controls><source src="/data/${clip.file_path}" type="video/mp4"></video></div>` : ''}
 
       <div class="sop-steps">
-        ${steps.length > 0 ? steps.map(step => `
+        ${steps.map(step => `
           <div class="card sop-step">
             <div class="sop-step-screenshot">
-              ${step.screenshot_path
-        ? `<img src="/data/${step.screenshot_path}" alt="Step ${step.step_number}">`
-        : `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);">No screenshot</div>`
-      }
+              ${step.screenshot_path ? `<img src="/data/${step.screenshot_path}">` : 'No Image'}
             </div>
             <div class="sop-step-content">
               <div class="sop-step-number">Step ${step.step_number}</div>
               <div class="sop-step-instruction">${escapeHtml(step.instruction)}</div>
               ${step.code_or_prompt ? `
                 <div class="sop-step-code">
-                  <button class="copy-btn" onclick="copyToClipboard(this, \`${escapeForAttr(step.code_or_prompt)}\`)">Copy</button>
+                  <button class="copy-btn" onclick="copyToClipboard(this, \`${step.code_or_prompt.replace(/`/g, '\\`')}\`)">Copy</button>
                   ${escapeHtml(step.code_or_prompt)}
                 </div>
               ` : ''}
             </div>
           </div>
-        `).join('') : '<div class="empty-state"><p>No SOP steps generated for this clip.</p></div>'}
+        `).join('')}
       </div>
     `;
-  } catch (err) {
-    app.innerHTML = `<div class="empty-state"><p style="color:var(--error)">Failed to load SOP: ${escapeHtml(err.message)}</p></div>`;
-  }
-}
-
-function escapeForAttr(str) {
-  if (!str) return '';
-  return str.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$');
+  } catch (e) { showToast(e.message, 'error'); }
 }
 
 function copyToClipboard(btn, text) {
   navigator.clipboard.writeText(text).then(() => {
     btn.textContent = 'Copied!';
-    setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
-  }).catch(() => {
-    showToast('Failed to copy', 'error');
+    setTimeout(() => btn.textContent = 'Copy', 2000);
   });
 }
 
-// Check double /api
-// The current router in server.js uses app.use('/api/videos', videoRoutes);
-// So the URL should be /api/videos/clips/${clipId}/export
-
 async function exportSop(clipId) {
+  showToast('Preparing ZIP...', 'info');
   try {
-    showToast('Preparing export...', 'info');
-    const url = `/api/videos/clips/${clipId}/export`;
-    const response = await fetch(url);
-    if (!response.ok) throw new Error('Export failed');
-
-    const blob = await response.blob();
-    const blobUrl = window.URL.createObjectURL(blob);
+    const res = await fetch(`/api/videos/clips/${clipId}/export`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = blobUrl;
-
-    // Try to get filename from header
-    const disposition = response.headers.get('Content-Disposition');
-    let filename = `sop_${clipId}.zip`;
-    if (disposition && disposition.indexOf('filename=') !== -1) {
-      filename = disposition.split('filename=')[1].replace(/"/g, '');
-    }
-
-    a.download = filename;
-    document.body.appendChild(a);
+    a.href = url;
+    a.download = `sop_${clipId}.zip`;
     a.click();
-    a.remove();
-    window.URL.revokeObjectURL(blobUrl);
-    showToast('SOP Exported successfully!', 'success');
-  } catch (err) {
-    showToast('Export failed: ' + err.message, 'error');
-  }
+    showToast('Export successful!', 'success');
+  } catch (e) { showToast('Export failed', 'error'); }
+}
+
+async function updateProviderStatus() {
+  try {
+    const s = await api.get('/api/settings');
+    const c = document.getElementById('provider-status');
+    if (c) {
+      c.className = `provider-status ${s.visionProvider}`;
+      c.querySelector('.status-text').textContent = s.visionProvider === 'local' ? 'Local Model (Qwen3-VL)' : 'Gemini Cloud';
+    }
+  } catch (e) { }
 }
 
 // ---- Register Routes ----
@@ -727,20 +600,6 @@ router.register('/video/:id', renderVideoDetail);
 router.register('/sop/:id', renderSop);
 
 // ---- Init ----
-async function updateProviderStatus() {
-  try {
-    const settings = await api.get('/api/settings');
-    const container = document.getElementById('provider-status');
-    if (container) {
-      container.className = `provider-status ${settings.visionProvider}`;
-      container.querySelector('.status-text').textContent =
-        settings.visionProvider === 'local' ? 'Local Model (Qwen3-VL)' : 'Gemini Cloud';
-    }
-  } catch (e) {
-    console.warn('Failed to fetch provider status');
-  }
-}
-
 document.addEventListener('DOMContentLoaded', () => {
   router.init();
   updateProviderStatus();

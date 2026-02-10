@@ -71,6 +71,7 @@ async function describeImage(imagePath, prompt) {
  */
 async function generateSopStepsLocal(frames, transcriptSlice, segmentTitle, ocrTexts) {
     const steps = [];
+    let totalScore = 0;
 
     for (let i = 0; i < frames.length; i++) {
         const frame = frames[i];
@@ -78,17 +79,16 @@ async function generateSopStepsLocal(frames, transcriptSlice, segmentTitle, ocrT
 
         const prompt = `You are creating step ${i + 1} of an SOP (Standard Operating Procedure) for a tutorial titled "${segmentTitle}".
 
-This screenshot is from timestamp ${Math.round(frame.timestamp)}s in the video.
+This screenshot is from timestamp ${Math.round(frame.timestamp)}s.
 
-${ocrText ? `TEXT VISIBLE ON SCREEN (from OCR):\n${ocrText}\n` : ''}
-${transcriptSlice ? `RELEVANT TRANSCRIPT:\n${transcriptSlice.slice(0, 500)}\n` : ''}
+Based on this screenshot:
+1. Write a clear instruction for what the user should do.
+2. If there's any code/text to type, include it.
+3. Score this frame's "educational value" (is it a tutorial step or just fluff?). 
+   Respond with a "score" from 0 to 100.
 
-Based on what you see in this screenshot:
-1. Write a clear, actionable instruction for what the user should do at this step
-2. If there's any specific text, code, URL, command, or prompt visible that the user needs to type, include it
-
-Respond in this exact JSON format (no markdown fences):
-{"instruction": "Clear instruction text", "codeOrPrompt": "any code or text to type, or null"}`;
+Respond in JSON (no fences):
+{"instruction": "...", "codeOrPrompt": "...", "score": 80}`;
 
         try {
             const response = await describeImage(frame.path, prompt);
@@ -98,13 +98,13 @@ Respond in this exact JSON format (no markdown fences):
                 const parsed = JSON.parse(cleaned);
                 steps.push({
                     frameIndex: i,
-                    instruction: parsed.instruction || 'Follow the step shown in the screenshot.',
+                    instruction: parsed.instruction || 'Follow the step shown.',
                     codeOrPrompt: parsed.codeOrPrompt || null,
                     timestamp: frame.timestamp,
                     screenshotPath: frame.path,
                 });
+                totalScore += (parsed.score || 50);
             } catch {
-                // If JSON parse fails, use the raw text as instruction
                 steps.push({
                     frameIndex: i,
                     instruction: response.slice(0, 500),
@@ -112,12 +112,13 @@ Respond in this exact JSON format (no markdown fences):
                     timestamp: frame.timestamp,
                     screenshotPath: frame.path,
                 });
+                totalScore += 30;
             }
         } catch (err) {
             console.error(`[LocalVision] Error processing frame ${i}:`, err.message);
             steps.push({
                 frameIndex: i,
-                instruction: `Step at ${Math.round(frame.timestamp)}s — see screenshot for details.`,
+                instruction: `Step at ${Math.round(frame.timestamp)}s`,
                 codeOrPrompt: null,
                 timestamp: frame.timestamp,
                 screenshotPath: frame.path,
@@ -125,7 +126,8 @@ Respond in this exact JSON format (no markdown fences):
         }
     }
 
-    return steps;
+    const tutorialScore = Math.round(totalScore / (frames.length || 1));
+    return { steps, tutorialScore };
 }
 
 module.exports = { isAvailable, describeImage, generateSopStepsLocal };

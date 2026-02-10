@@ -48,6 +48,31 @@ async function uploadToGemini(filePath, mimeType) {
 }
 
 /**
+ * Helper to retry an async function with exponential backoff
+ */
+async function withRetry(fn, maxRetries = 3, initialDelay = 2000) {
+    let lastError;
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            return await fn();
+        } catch (err) {
+            lastError = err;
+            const isRateLimit = err.message?.toLowerCase().includes('429') || err.message?.toLowerCase().includes('quota');
+            const isNetwork = err.message?.toLowerCase().includes('fetch') || err.message?.toLowerCase().includes('network');
+
+            if (isRateLimit || isNetwork) {
+                const delay = initialDelay * Math.pow(2, i);
+                console.warn(`[Gemini] Attempt ${i + 1} failed. Retrying in ${delay}ms...`);
+                await new Promise(r => setTimeout(r, delay));
+                continue;
+            }
+            throw err; // Permanent error
+        }
+    }
+    throw lastError;
+}
+
+/**
  * Phase 1: Transcribe audio and segment into topics.
  * Uses audio-only for cost efficiency.
  */
@@ -86,7 +111,7 @@ Respond ONLY with this exact JSON structure:
 
 IMPORTANT: Return valid JSON only. No markdown fences. Escape all special characters.`;
 
-    const result = await model.generateContent([prompt, audioPart]);
+    const result = await withRetry(() => model.generateContent([prompt, audioPart]));
     let text = result.response.text().trim();
 
     // Parse JSON, stripping any markdown fences if present
@@ -157,22 +182,16 @@ TRANSCRIPT SLICE:
 ${transcriptSlice}
 
 YOUR TASK:
-Create clear, actionable SOP steps. For each step:
-1. Identify which screenshot best represents this step (by frame number)
-2. Write a clear instruction for what the user should do
-3. If there's any specific text, code, prompt, URL, command, or value the user needs to type/enter, include it in "codeOrPrompt"
-
-RULES:
-- Steps should be in logical order
-- Each step should be ONE clear action
-- Be specific and precise ("Click the blue 'Submit' button in the top right" not "Click submit")
-- Include ALL relevant code, prompts, or text that needs to be typed
-- Skip any steps that are just waiting or filler
-- Reference what's visible on screen in each step
-- Use the OCR text to identify exact button labels, field names, URLs, and code snippets
+1. Annotate clear, actionable SOP steps.
+2. Evaluate if this clip is actually a functional tutorial (something someone can follow).
+   Assign a "tutorialScore" from 0 to 100.
+   - 100: A clear screen-share or demo with specific steps.
+   - 50: A mix of talking and high-level demo.
+   - 0: Just a person talking, a movie scene, or random footage with no educational value.
 
 Respond in this exact JSON format:
 {
+  "tutorialScore": 85,
   "steps": [
     {
       "frameIndex": 0,
@@ -182,10 +201,15 @@ Respond in this exact JSON format:
   ]
 }
 
-Return ONLY valid JSON, no markdown fences.`;
+RULES:
+- Steps should be in logical order
+- Each step should be ONE clear action
+- Be specific and precise
+- Use the OCR text to identify exact labels and code
+- Return ONLY valid JSON, no markdown fences.`;
 
     const contentParts = [prompt, ...imageParts.map(ip => ip.part)];
-    const result = await model.generateContent(contentParts);
+    const result = await withRetry(() => model.generateContent(contentParts));
     let text = result.response.text().trim();
 
     // Parse JSON, stripping any markdown fences if present
@@ -210,11 +234,13 @@ Return ONLY valid JSON, no markdown fences.`;
     }
 
     // Attach timestamps to steps
-    return parsed.steps.map(step => ({
+    const steps = parsed.steps.map(step => ({
         ...step,
         timestamp: frames[step.frameIndex]?.timestamp || frames[0]?.timestamp || 0,
         screenshotPath: frames[step.frameIndex]?.path || frames[0]?.path,
     }));
+
+    return { steps, tutorialScore: parsed.tutorialScore || 0 };
 }
 
 module.exports = {
