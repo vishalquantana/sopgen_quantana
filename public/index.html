@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SOPGen — Video to SOP Generator</title>
+  <meta name="description"
+    content="Turn long workshop and tutorial videos into bite-sized clips and step-by-step SOP documents, powered by AI.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
+    rel="stylesheet">
+  <link rel="stylesheet" href="/css/styles.css">
+</head>
+
+<body>
+  <!-- NAV -->
+  <nav class="nav" id="nav">
+    <div class="nav-brand" onclick="router.navigate('/')">
+      <span class="nav-logo">✦</span>
+      <span class="nav-title">SOPGen</span>
+    </div>
+    <div class="nav-links">
+      <div class="provider-status" id="provider-status">
+        <span class="status-dot"></span>
+        <span class="status-text">Detecting...</span>
+      </div>
+      <a href="#/" class="nav-link active" data-route="/">Dashboard</a>
+      <a href="#/upload" class="nav-link" data-route="/upload">Upload</a>
+    </div>
+  </nav>
+
+  <!-- MAIN -->
+  <main class="main" id="app">
+    <!-- Content injected by JS -->
+  </main>
+
+  <!-- TOAST -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <script src="/js/app.js"></script>
+</body>
+
+</html>
